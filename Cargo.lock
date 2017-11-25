@@ -1,0 +1,11 @@
+[[package]]
+name = "twister"
+version = "0.1.0"
+dependencies = [
+ "twister_http 0.1.0",
+]
+
+[[package]]
+name = "twister_http"
+version = "0.1.0"
+

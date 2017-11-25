@@ -1,0 +1,8 @@
+[package]
+name = "twister"
+version = "0.1.0"
+authors = ["Greg Beard <greg.beard@vodafone.com>"]
+
+[dependencies]
+twister_http = { path = "twister_http" }
+
