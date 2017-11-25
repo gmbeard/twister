@@ -489,8 +489,7 @@ mod request_parser_should {
         let mut header_size = 16;
         loop {
             let mut headers = vec![Header::default(); header_size];
-            if let Some(r) = HttpObjectParser::new(&mut headers).parse::<Request>(proxy_connect)
-            {
+            if let Some(r) = HttpObjectParser::new(&mut headers).parse::<Request>(proxy_connect) {
 
                 assert_eq!(HttpMethod::Connect, r.method);
                 assert_eq!("docs.rs:443", str::from_utf8(r.path).unwrap());

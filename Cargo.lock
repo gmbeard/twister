@@ -2,6 +2,14 @@
 name = "twister"
 version = "0.1.0"
 dependencies = [
+ "twister_core 0.1.0",
+ "twister_http 0.1.0",
+]
+
+[[package]]
+name = "twister_core"
+version = "0.1.0"
+dependencies = [
  "twister_http 0.1.0",
 ]
 

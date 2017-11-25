@@ -5,4 +5,5 @@ authors = ["Greg Beard <greg.beard@vodafone.com>"]
 
 [dependencies]
 twister_http = { path = "twister_http" }
+twister_core = { path = "twister_core" }
 
