@@ -7,13 +7,9 @@ use twister_http::parser::HttpObjectParser;
 
 fn read_into<S: Read>(buffer: &mut Vec<u8>, from: &mut S) -> Result<u64, io::Error> {
     let mut tmp = [0_u8; 512];
-    match io::copy(from, &mut &mut tmp[..]) {
-        Ok(n) => {
-            buffer.extend(&tmp[..n as usize]);
-            return Ok(n);
-        }
-        result => result,
-    }
+    let n = from.read(&mut tmp)?;
+    buffer.extend(&tmp[..n]);
+    Ok(n as _)
 }
 
 pub struct Connection<S, F, U>
@@ -46,9 +42,10 @@ impl<S, F, U> Connection<S, F, U>
     }
 
     pub fn poll(&mut self) -> Result<Option<S>, io::Error> {
-
+        
         let next = match mem::replace(&mut self.state, ConnectionState::Done) {
             ConnectionState::Request(mut handler) => {
+                debug!("Reading initial request");
                 match handler.poll() {
                     Ok(RequestHandlerResult::MoreDataRequired) => 
                         ConnectionState::Request(handler),
@@ -67,7 +64,7 @@ impl<S, F, U> Connection<S, F, U>
             },
             ConnectionState::Response(mut handler) => {
                 match handler.poll() {
-                    Ok(ResponseHandlerResult::Done(_)) => return Ok(Some(handler.into_inner())),
+                    Ok(ResponseHandlerResult::Done(stream)) => return Ok(Some(stream)),
                     Ok(ResponseHandlerResult::NotDone) => ConnectionState::Response(handler),
                     _ => return Ok(Some(handler.into_inner())),
                 }
@@ -83,7 +80,7 @@ impl<S, F, U> Connection<S, F, U>
 
             ConnectionState::TunnellingRead(mut inside, mut outside) => {
                 match io::copy(&mut inside, &mut outside) {
-                    Ok(n) if n == 0 => return Ok(Some(inside)),
+                    Ok(0) => return Ok(Some(inside)),
                     Ok(_) => ConnectionState::TunnellingRead(inside, outside),
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ConnectionState::TunnellingWrite(outside, inside),
                     _ => return Ok(Some(inside)),
@@ -92,7 +89,7 @@ impl<S, F, U> Connection<S, F, U>
 
             ConnectionState::TunnellingWrite(mut outside, mut inside) => {
                 match io::copy(&mut outside, &mut inside) {
-                    Ok(n) if n == 0 => return Ok(Some(inside)),
+                    Ok(0) => return Ok(Some(inside)),
                     Ok(_) => ConnectionState::TunnellingWrite(outside, inside),
                     Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => ConnectionState::TunnellingRead(inside, outside),
                     _ => return Ok(Some(inside)),
@@ -115,6 +112,7 @@ impl<S, U> ConnectionState<S, U>
     }
 }
 
+#[cfg_attr(test, derive(Debug, PartialEq))]
 enum RequestHandlerResult<S> {
     MoreDataRequired,
     WantsProxy(String, S),
@@ -137,20 +135,27 @@ impl<S: Read> RequestHandler<S> {
     }
 
     fn poll(&mut self) -> Result<RequestHandlerResult<S>, io::Error> {
-        let n = read_into(&mut self.1, self.0.as_mut().unwrap())?;
-        if n == 0 {
-            return Err(io::ErrorKind::UnexpectedEof.into());
-        }
+        let n = match read_into(&mut self.1, self.0.as_mut().unwrap()) {
+            Ok(0) => return Err(io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => n,
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
+            Err(e) => return Err(e),
+        };
+
+        debug!("Read {} bytes of request", n);
 
         let mut headers = [Header::default(); 32];
         let object = HttpObjectParser::new(&mut headers)
             .parse::<Request>(&*self.1);
 
         if object.is_none() {
+            debug!("Request not done: {}", ::std::str::from_utf8(&*self.1).unwrap());
             return Ok(RequestHandlerResult::MoreDataRequired);
         }
 
         let object = object.unwrap();
+
+        debug!("Recieved request for {}", ::std::str::from_utf8(object.path).unwrap());
 
         match object.method {
             HttpMethod::Connect => 
@@ -192,18 +197,133 @@ impl<S: Write> ResponseHandler<S> {
 mod connection_should {
     use super::*;
     use std::io::Cursor;
+    use std::cmp;
+
+    struct Trickle<T>(T);
+
+    impl<T: Read + Write> Trickle<T> {
+        fn new(stream: T) -> Trickle<T> {
+            Trickle(stream)
+        }
+
+        fn into_inner(self) -> T {
+            self.0
+        }
+    }
+
+    impl<T: Read> Read for Trickle<T> {
+        fn read(&mut self, buffer: &mut [u8]) -> Result<usize, io::Error> {
+            let to_read = cmp::min(1, buffer.len());
+            return self.0.read(&mut buffer[..to_read]);
+        }
+    }
+
+    impl<T: Write> Write for Trickle<T> {
+        fn write(&mut self, buffer: &[u8]) -> Result<usize, io::Error> {
+            let to_write = cmp::min(1, buffer.len());
+            self.0.write(&buffer[..to_write])
+        }
+
+        fn flush(&mut self) -> Result<(), io::Error> {
+            self.0.flush()
+        }
+    }
+
+    enum StagedRead {
+        Connect(usize, Cursor<Vec<u8>>, Cursor<Vec<u8>>),
+        Request(Cursor<Vec<u8>>, Cursor<Vec<u8>>),
+        Done,
+    }
+
+    impl StagedRead {
+        fn new() -> StagedRead {
+            StagedRead::Connect(
+                b"CONNECT source HTTP/1.0\r\n\r\n".len(),
+                Cursor::new(
+                    b"CONNECT source HTTP/1.0\r\n\
+                      \r\n\
+                      GET /index.html HTTP/1.0\r\n\
+                      \r\n".to_vec()),
+                Cursor::new(vec![])
+            )
+        }
+
+        fn input_buffer_mut(&mut self) -> &mut Cursor<Vec<u8>> {
+            match *self {
+                StagedRead::Connect(.., ref mut input) => input,
+                StagedRead::Request(_ , ref mut input) => input,
+                StagedRead::Done => panic!("Stream invalid"),
+            }
+        }
+
+        fn into_inner(mut self) -> (Cursor<Vec<u8>>, Cursor<Vec<u8>>) {
+            match mem::replace(&mut self, StagedRead::Done) {
+                StagedRead::Connect(_, input, output) => (input, output),
+                StagedRead::Request(input, output) => (input, output),
+                StagedRead::Done => panic!("Stream invalid"),
+            }
+        }
+    }
+
+    impl Read for StagedRead {
+        fn read(&mut self, buffer: &mut [u8]) -> Result<usize, io::Error> {
+            let (result, next) = match mem::replace(self, StagedRead::Done) {
+                StagedRead::Connect(read, mut output, input) => {
+                    if read == 0 {
+                        (Err(io::ErrorKind::WouldBlock.into()), StagedRead::Request(output, input))
+                    }
+                    else {
+                        let to_read = cmp::min(read, buffer.len());
+                        let n = output.read(&mut buffer[..to_read])?;
+                        (Ok(n), StagedRead::Connect(read - n, output, input))
+                    }
+                },
+                StagedRead::Request(mut output, input) => (output.read(buffer), StagedRead::Request(output, input)),
+                StagedRead::Done => panic!("Stread invalid!"),
+            };
+
+            *self= next;
+            result
+        }
+    }
+
+    impl Write for StagedRead {
+        fn write(&mut self, buffer: &[u8]) -> Result<usize, io::Error> {
+            self.input_buffer_mut().write(buffer)
+        }
+
+        fn flush(&mut self) -> Result<(), io::Error> {
+            self.input_buffer_mut().flush()
+        }
+    }
+
+    #[test]
+    fn handle_connect_request() {
+        let mut stream = Trickle(StagedRead::new());
+//        let mut stream = Trickle(Cursor::new(b"CONNECT source HTTP/1.0\r\n\r\n".to_vec()));
+        let mut handler = RequestHandler::new(stream);
+
+        let dest = loop {
+            match handler.poll().unwrap() {
+                RequestHandlerResult::MoreDataRequired => continue,
+                RequestHandlerResult::WantsProxy(dest, _) => break dest,
+                RequestHandlerResult::WantsResource(dest, _) => panic!("Got WantsResource {}", dest),
+                RequestHandlerResult::Invalid => panic!("Got Invalid"),
+            }
+        };
+
+        assert_eq!("source", &*dest);
+    }
 
     #[test]
     fn proxy_request() {
-        let request = b"CONNECT source HTTP/1.1\r\n\
-                        \r\n".to_vec();
         let upstream = b"Hello, World!".to_vec();
         let mut requested_upstream = false;
 
         let s = {
-            let mut conn = Connection::new(Cursor::new(request), |dest| {
+            let mut conn = Connection::new(Trickle::new(StagedRead::new()), |dest| {
                 requested_upstream = dest == "source";
-                Cursor::new(upstream.clone())
+                Trickle::new(Cursor::new(upstream.clone()))
             });
 
             let s = loop {
@@ -216,14 +336,12 @@ mod connection_should {
         };
 
         assert!(requested_upstream);
-        let v = s.into_inner();
-        assert_eq!(
-            "CONNECT source HTTP/1.1\r\n\
-             \r\n\
-             HTTP/1.1 200 OK\r\n\
-             \r\n\
-             Hello, World!",
-            str::from_utf8(&*v).unwrap());
+        let (stream, sink) = s.into_inner().into_inner();
+        let input = sink.into_inner();
+        let output = stream.into_inner();
+
+//        assert_eq!("GET / HTTP/1.0\r\n\r\n", str::from_utf8(&*output).unwrap());
+        assert_eq!("HTTP/1.1 200 OK\r\n\r\nHello, World!", str::from_utf8(&*input).unwrap());
     }
 }
 
